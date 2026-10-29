@@ -1,0 +1,14 @@
+# /etc/systemd/system/grout-agent.service (baked into the router VM image)
+[Unit]
+Description=Grout Router Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/grout-agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

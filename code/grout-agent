@@ -1,0 +1,594 @@
+#!/usr/bin/python3
+"""Grout agent — lightweight REST API for router VM configuration.
+
+Runs on the management interface and receives network configuration
+commands from the Neutron grout service provider.
+"""
+
+import argparse
+import hashlib
+import hmac
+import json
+import logging
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+LOG = logging.getLogger('grout-agent')
+LISTEN_PORT = 9100
+
+
+# -- Heartbeat sender ---------------------------------------------------------
+
+class HeartbeatSender:
+    """Sends periodic UDP heartbeats to the controller."""
+
+    def __init__(self, target_host, target_port, mgmt_ip, key, interval):
+        self._target = (target_host, int(target_port))
+        self._mgmt_ip = mgmt_ip
+        self._key = key.encode()
+        self._interval = interval
+        self._seq = 0
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def start(self):
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+        LOG.info('heartbeat sender started -> %s:%d every %ds',
+                 self._target[0], self._target[1], self._interval)
+
+    def _run(self):
+        while True:
+            try:
+                msg = json.dumps({
+                    'mgmt_ip': self._mgmt_ip,
+                    'seq': self._seq,
+                }).encode()
+                mac = hmac.new(self._key, msg, hashlib.sha256).hexdigest()
+                self._sock.sendto(msg + mac.encode(), self._target)
+                self._seq += 1
+            except Exception as e:
+                LOG.warning('heartbeat send failed: %s', e)
+            time.sleep(self._interval)
+
+
+def load_config(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+# -- Backend abstraction ------------------------------------------------------
+
+class Backend:
+    """Base class for network backends."""
+
+    def add_route(self, destination, nexthop):
+        raise NotImplementedError
+
+    def delete_route(self, destination, nexthop):
+        raise NotImplementedError
+
+    def list_routes(self):
+        raise NotImplementedError
+
+    def configure_interface(self, mac, ip_address, prefix_len, gateway=None):
+        raise NotImplementedError
+
+    def add_floating_ip(self, floating_ip, fixed_ip):
+        raise NotImplementedError
+
+    def remove_floating_ip(self, floating_ip, fixed_ip):
+        raise NotImplementedError
+
+    def enable_snat(self, external_ip, internal_cidr):
+        raise NotImplementedError
+
+    def disable_snat(self, external_ip, internal_cidr):
+        raise NotImplementedError
+
+    def add_port_forwarding(self, protocol, floating_ip, external_port,
+                            internal_ip, internal_port):
+        raise NotImplementedError
+
+    def remove_port_forwarding(self, protocol, floating_ip, external_port,
+                               internal_ip, internal_port):
+        raise NotImplementedError
+
+    def list_nat(self):
+        raise NotImplementedError
+
+
+class LinuxBackend(Backend):
+    """Linux kernel backend using ip and nft commands.
+
+    Tenant interfaces, routes, and NAT rules live in the 'grout-ns'
+    network namespace.  The management interface stays in the default
+    namespace so the agent remains reachable from the controller.
+    """
+
+    NAMESPACE = 'grout-ns'
+
+    def __init__(self):
+        self._run_cmd(
+            ['ip', 'netns', 'add', self.NAMESPACE], check=False)
+        self._ns_run(['sysctl', '-w', 'net.ipv4.ip_forward=1'])
+        self._ns_run(['ip', 'link', 'set', 'lo', 'up'])
+        LOG.info('namespace %s ready', self.NAMESPACE)
+
+    def _run_cmd(self, args, check=True, stdin=None):
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=30, input=stdin)
+        if check and result.returncode != 0:
+            raise RuntimeError(
+                'cmd %s failed (%d): %s' % (
+                    args, result.returncode, result.stderr))
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+    def _ns_run(self, args, **kwargs):
+        return self._run_cmd(
+            ['ip', 'netns', 'exec', self.NAMESPACE] + list(args), **kwargs)
+
+    def _find_iface_by_mac(self, mac):
+        _, out, _ = self._run_cmd(['ip', '-o', 'link', 'show'])
+        mac_lower = mac.lower()
+        for line in out.splitlines():
+            if mac_lower in line.lower():
+                return line.split(':')[1].strip()
+        raise ValueError('no interface with MAC %s' % mac)
+
+    def _ensure_grout_table(self):
+        rc, _, _ = self._ns_run(
+            ['nft', 'list', 'table', 'ip', 'grout'], check=False)
+        if rc != 0:
+            self._ns_run(['nft', '-f', '-'], stdin=(
+                'table ip grout {\n'
+                '  chain prerouting {\n'
+                '    type nat hook prerouting priority -100; policy accept;\n'
+                '  }\n'
+                '  chain postrouting {\n'
+                '    type nat hook postrouting priority 100; policy accept;\n'
+                '  }\n'
+                '}\n'))
+
+    # -- routes ---------------------------------------------------------------
+
+    def add_route(self, destination, nexthops):
+        if isinstance(nexthops, str):
+            nexthops = [nexthops]
+        cmd = ['ip', 'route', 'replace', destination]
+        for nh in nexthops:
+            cmd += ['nexthop', 'via', nh]
+        rc, _, err = self._ns_run(cmd, check=False)
+        if rc != 0:
+            raise RuntimeError('route add failed: %s' % err)
+
+    def delete_route(self, destination, nexthops):
+        if isinstance(nexthops, str):
+            nexthops = [nexthops]
+        for nh in nexthops:
+            rc, _, err = self._ns_run(
+                ['ip', 'route', 'del', destination, 'via', nh], check=False)
+            if rc != 0 and 'No such process' not in err:
+                raise RuntimeError('route del failed: %s' % err)
+
+    def list_routes(self):
+        rc, out, err = self._ns_run(
+            ['ip', '-j', 'route', 'show'], check=False)
+        if rc != 0:
+            raise RuntimeError('route list failed: %s' % err)
+        return json.loads(out)
+
+    # -- interfaces -----------------------------------------------------------
+
+    def configure_interface(self, mac, ip_address, prefix_len, gateway=None):
+        iface = self._find_iface_by_mac(mac)
+
+        self._run_cmd(
+            ['ip', 'link', 'set', iface, 'netns', self.NAMESPACE])
+
+        rc, _, err = self._ns_run(
+            ['ip', 'addr', 'add', '%s/%s' % (ip_address, prefix_len),
+             'dev', iface], check=False)
+        if rc != 0 and 'File exists' not in err:
+            raise RuntimeError('ip addr add failed: %s' % err)
+
+        self._ns_run(['ip', 'link', 'set', iface, 'up'], check=False)
+
+        if gateway:
+            self._ns_run(
+                ['ip', 'route', 'add', 'default', 'via', gateway,
+                 'dev', iface, 'metric', '100'], check=False)
+
+        return iface
+
+    # -- floating IP (1:1 NAT) ------------------------------------------------
+
+    def add_floating_ip(self, floating_ip, fixed_ip):
+        self._ensure_grout_table()
+        comment = 'grout-fip-%s' % floating_ip
+        self._ns_run(['nft', 'add', 'rule', 'ip', 'grout', 'prerouting',
+                       'ip', 'daddr', floating_ip,
+                       'dnat', 'to', fixed_ip,
+                       'comment', '"%s"' % comment])
+        self._ns_run(['nft', 'add', 'rule', 'ip', 'grout', 'postrouting',
+                       'ip', 'saddr', fixed_ip,
+                       'snat', 'to', floating_ip,
+                       'comment', '"%s"' % comment])
+
+    def remove_floating_ip(self, floating_ip, fixed_ip):
+        self._delete_rules_by_comment('grout-fip-%s' % floating_ip)
+
+    # -- SNAT -----------------------------------------------------------------
+
+    def enable_snat(self, external_ip, internal_cidr):
+        self._ensure_grout_table()
+        comment = 'grout-snat-%s' % internal_cidr.replace('/', '_')
+        self._ns_run(['nft', 'add', 'rule', 'ip', 'grout', 'postrouting',
+                       'ip', 'saddr', internal_cidr,
+                       'snat', 'to', external_ip,
+                       'comment', '"%s"' % comment])
+
+    def disable_snat(self, external_ip, internal_cidr):
+        self._delete_rules_by_comment(
+            'grout-snat-%s' % internal_cidr.replace('/', '_'))
+
+    # -- port forwarding ------------------------------------------------------
+
+    def add_port_forwarding(self, protocol, floating_ip, external_port,
+                            internal_ip, internal_port):
+        self._ensure_grout_table()
+        comment = 'grout-pf-%s-%s-%s' % (protocol, floating_ip, external_port)
+        self._ns_run(['nft', 'add', 'rule', 'ip', 'grout', 'prerouting',
+                       'ip', 'daddr', floating_ip,
+                       protocol, 'dport', str(external_port),
+                       'dnat', 'to', '%s:%s' % (internal_ip, internal_port),
+                       'comment', '"%s"' % comment])
+
+    def remove_port_forwarding(self, protocol, floating_ip, external_port,
+                               internal_ip, internal_port):
+        self._delete_rules_by_comment(
+            'grout-pf-%s-%s-%s' % (protocol, floating_ip, external_port))
+
+    # -- NAT listing ----------------------------------------------------------
+
+    def list_nat(self):
+        rc, out, err = self._ns_run(
+            ['nft', '-j', 'list', 'table', 'ip', 'grout'], check=False)
+        if rc != 0:
+            return []
+
+        entries = []
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return []
+
+        for item in data.get('nftables', []):
+            rule = item.get('rule')
+            if not rule:
+                continue
+            comment = rule.get('comment', '')
+            if comment.startswith('grout-fip-'):
+                fip = comment[len('grout-fip-'):]
+                fixed = self._extract_nat_target(rule)
+                if fixed:
+                    if rule.get('chain') == 'prerouting':
+                        entries.append({
+                            'type': 'floating_ip',
+                            'floating_ip': fip,
+                            'fixed_ip': fixed,
+                        })
+            elif comment.startswith('grout-snat-'):
+                cidr = comment[len('grout-snat-'):].replace('_', '/')
+                ext = self._extract_nat_target(rule)
+                if ext:
+                    entries.append({
+                        'type': 'snat',
+                        'external_ip': ext,
+                        'internal_cidr': cidr,
+                    })
+            elif comment.startswith('grout-pf-'):
+                parts = comment[len('grout-pf-'):].split('-', 2)
+                if len(parts) >= 3:
+                    target = self._extract_nat_target(rule)
+                    if target and ':' in target:
+                        int_ip, int_port = target.rsplit(':', 1)
+                        entries.append({
+                            'type': 'port_forwarding',
+                            'protocol': parts[0],
+                            'floating_ip': parts[1],
+                            'external_port': int(parts[2]),
+                            'internal_ip': int_ip,
+                            'internal_port': int(int_port),
+                        })
+        return entries
+
+    def _extract_nat_target(self, rule):
+        for expr in rule.get('expr', []):
+            if isinstance(expr, dict):
+                for key in ('dnat', 'snat'):
+                    nat = expr.get(key)
+                    if nat and isinstance(nat, dict):
+                        addr = nat.get('addr')
+                        port = nat.get('port')
+                        if addr and port:
+                            return '%s:%s' % (addr, port)
+                        if addr:
+                            return str(addr)
+        return None
+
+    def _delete_rules_by_comment(self, comment):
+        rc, out, _ = self._ns_run(
+            ['nft', '-j', '-a', 'list', 'table', 'ip', 'grout'], check=False)
+        if rc != 0:
+            return
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return
+        for item in data.get('nftables', []):
+            rule = item.get('rule')
+            if not rule:
+                continue
+            if rule.get('comment', '') == comment:
+                chain = rule.get('chain')
+                handle = rule.get('handle')
+                if chain and handle:
+                    self._ns_run(
+                        ['nft', 'delete', 'rule', 'ip', 'grout',
+                         chain, 'handle', str(handle)], check=False)
+
+
+class GroutBackend(Backend):
+    """grcli backend — stub for future implementation."""
+    pass
+
+
+# -- HTTP handler -------------------------------------------------------------
+
+class AgentHandler(BaseHTTPRequestHandler):
+
+    def _read_body(self):
+        length = int(self.headers.get('Content-Length', 0))
+        if length == 0:
+            return {}
+        return json.loads(self.rfile.read(length))
+
+    def _reply(self, code, body=None):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        if body is not None:
+            self.wfile.write(json.dumps(body).encode())
+
+    def log_message(self, fmt, *args):
+        LOG.info(fmt, *args)
+
+    # -- dispatch -------------------------------------------------------------
+
+    def do_GET(self):
+        if self.path == '/health':
+            self._reply(200, {'status': 'ok'})
+        elif self.path == '/routes':
+            self._handle_routes_get()
+        elif self.path == '/nat':
+            self._handle_nat_get()
+        else:
+            self._reply(404, {'error': 'not found'})
+
+    def do_PUT(self):
+        handlers = {
+            '/route': lambda: self._handle_route('PUT'),
+            '/interface': self._handle_interface,
+            '/floatingip': lambda: self._handle_floating_ip('PUT'),
+            '/snat': lambda: self._handle_snat('PUT'),
+            '/portforwarding': lambda: self._handle_port_forwarding('PUT'),
+        }
+        handler = handlers.get(self.path)
+        if handler:
+            handler()
+        else:
+            self._reply(404, {'error': 'not found'})
+
+    def do_DELETE(self):
+        handlers = {
+            '/route': lambda: self._handle_route('DELETE'),
+            '/floatingip': lambda: self._handle_floating_ip('DELETE'),
+            '/snat': lambda: self._handle_snat('DELETE'),
+            '/portforwarding': lambda: self._handle_port_forwarding('DELETE'),
+        }
+        handler = handlers.get(self.path)
+        if handler:
+            handler()
+        else:
+            self._reply(404, {'error': 'not found'})
+
+    # -- route handlers -------------------------------------------------------
+
+    def _handle_route(self, method):
+        data = self._read_body()
+        dest = data.get('destination')
+        nexthop = data.get('nexthop')
+        if not dest or not nexthop:
+            self._reply(400, {'error': 'destination and nexthop required'})
+            return
+        try:
+            if method == 'PUT':
+                self.server.backend.add_route(dest, nexthop)
+                LOG.info('added route %s via %s (ECMP: %s)',
+                         dest, nexthop,
+                         isinstance(nexthop, list) and len(nexthop) > 1)
+            else:
+                self.server.backend.delete_route(dest, nexthop)
+                LOG.info('deleted route %s via %s', dest, nexthop)
+            self._reply(200, {'status': 'ok'})
+        except Exception as e:
+            LOG.error('route %s failed: %s', method, e)
+            self._reply(500, {'error': str(e)})
+
+    def _handle_routes_get(self):
+        try:
+            routes = self.server.backend.list_routes()
+            self._reply(200, {'routes': routes})
+        except Exception as e:
+            self._reply(500, {'error': str(e)})
+
+    # -- interface handler ----------------------------------------------------
+
+    def _handle_interface(self):
+        data = self._read_body()
+        mac = data.get('mac')
+        ip_address = data.get('ip_address')
+        prefix_len = data.get('prefix_len')
+        gateway = data.get('gateway')
+        if not mac or not ip_address or not prefix_len:
+            self._reply(400, {'error': 'mac, ip_address, prefix_len required'})
+            return
+        try:
+            iface = self.server.backend.configure_interface(
+                mac, ip_address, prefix_len, gateway)
+            LOG.info('configured %s/%s on %s (gw=%s)',
+                     ip_address, prefix_len, iface, gateway)
+            self._reply(200, {'status': 'ok', 'interface': iface})
+        except ValueError as e:
+            self._reply(404, {'error': str(e)})
+        except Exception as e:
+            self._reply(500, {'error': str(e)})
+
+    # -- floating IP handler --------------------------------------------------
+
+    def _handle_floating_ip(self, method):
+        data = self._read_body()
+        floating_ip = data.get('floating_ip')
+        fixed_ip = data.get('fixed_ip')
+        if not floating_ip or not fixed_ip:
+            self._reply(400, {'error': 'floating_ip and fixed_ip required'})
+            return
+        try:
+            if method == 'PUT':
+                self.server.backend.add_floating_ip(floating_ip, fixed_ip)
+                LOG.info('added floating IP %s -> %s', floating_ip, fixed_ip)
+            else:
+                self.server.backend.remove_floating_ip(floating_ip, fixed_ip)
+                LOG.info('removed floating IP %s -> %s', floating_ip, fixed_ip)
+            self._reply(200, {'status': 'ok'})
+        except Exception as e:
+            LOG.error('floating IP %s failed: %s', method, e)
+            self._reply(500, {'error': str(e)})
+
+    # -- SNAT handler ---------------------------------------------------------
+
+    def _handle_snat(self, method):
+        data = self._read_body()
+        external_ip = data.get('external_ip')
+        internal_cidr = data.get('internal_cidr')
+        if not external_ip or not internal_cidr:
+            self._reply(400,
+                        {'error': 'external_ip and internal_cidr required'})
+            return
+        try:
+            if method == 'PUT':
+                self.server.backend.enable_snat(external_ip, internal_cidr)
+                LOG.info('enabled SNAT %s for %s', external_ip, internal_cidr)
+            else:
+                self.server.backend.disable_snat(external_ip, internal_cidr)
+                LOG.info('disabled SNAT %s for %s', external_ip, internal_cidr)
+            self._reply(200, {'status': 'ok'})
+        except Exception as e:
+            LOG.error('SNAT %s failed: %s', method, e)
+            self._reply(500, {'error': str(e)})
+
+    # -- port forwarding handler ----------------------------------------------
+
+    def _handle_port_forwarding(self, method):
+        data = self._read_body()
+        protocol = data.get('protocol')
+        floating_ip = data.get('floating_ip')
+        external_port = data.get('external_port')
+        internal_ip = data.get('internal_ip')
+        internal_port = data.get('internal_port')
+        if not all([protocol, floating_ip, external_port,
+                    internal_ip, internal_port]):
+            self._reply(400, {'error': 'protocol, floating_ip, external_port, '
+                                       'internal_ip, internal_port required'})
+            return
+        try:
+            if method == 'PUT':
+                self.server.backend.add_port_forwarding(
+                    protocol, floating_ip, external_port,
+                    internal_ip, internal_port)
+                LOG.info('added port forwarding %s %s:%s -> %s:%s',
+                         protocol, floating_ip, external_port,
+                         internal_ip, internal_port)
+            else:
+                self.server.backend.remove_port_forwarding(
+                    protocol, floating_ip, external_port,
+                    internal_ip, internal_port)
+                LOG.info('removed port forwarding %s %s:%s -> %s:%s',
+                         protocol, floating_ip, external_port,
+                         internal_ip, internal_port)
+            self._reply(200, {'status': 'ok'})
+        except Exception as e:
+            LOG.error('port forwarding %s failed: %s', method, e)
+            self._reply(500, {'error': str(e)})
+
+    # -- NAT listing ----------------------------------------------------------
+
+    def _handle_nat_get(self):
+        try:
+            entries = self.server.backend.list_nat()
+            self._reply(200, {'nat': entries})
+        except Exception as e:
+            self._reply(500, {'error': str(e)})
+
+
+# -- main ---------------------------------------------------------------------
+
+BACKENDS = {
+    'linux': LinuxBackend,
+    'grout': GroutBackend,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Grout router agent')
+    parser.add_argument('--backend', choices=BACKENDS.keys(), default='linux')
+    parser.add_argument('--port', type=int, default=LISTEN_PORT)
+    parser.add_argument('--config', default='/etc/grout/agent.conf')
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(name)s %(levelname)s %(message)s',
+        stream=sys.stdout)
+
+    conf = load_config(args.config)
+    if conf.get('heartbeat_target'):
+        host, port = conf['heartbeat_target'].rsplit(':', 1)
+        sender = HeartbeatSender(
+            host, port,
+            conf['mgmt_ip'],
+            conf['heartbeat_key'],
+            conf.get('heartbeat_interval', 5))
+        sender.start()
+
+    backend = BACKENDS[args.backend]()
+    server = HTTPServer(('0.0.0.0', args.port), AgentHandler)
+    server.backend = backend
+    LOG.info('grout-agent listening on port %d (backend: %s)',
+             args.port, args.backend)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    server.server_close()
+
+
+if __name__ == '__main__':
+    main()

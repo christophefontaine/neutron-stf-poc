@@ -1,0 +1,27 @@
+# /etc/neutron/neutron.conf (devstack VM) — sections relevant to the PoC
+
+[DEFAULT]
+service_plugins = router
+api_workers = 2
+
+[service_providers]
+# Grout registered as the DEFAULT L3 provider for this PoC.
+# Drop ":default" and use a flavor to select it per-router instead.
+service_provider = L3_ROUTER_NAT:grout:neutron.services.ovn_l3.service_providers.grout.Grout:default
+
+[grout]
+router_vm_flavor = ds1G
+router_vm_image = fedora-44-cloudinit
+mgmt_network_name = router-mgmt-net
+mgmt_subnet_cidr = 192.168.254.0/24
+mgmt_host_ip = 192.168.254.1
+agent_port = 9100
+agent_timeout = 10
+vm_ssh_password = grout
+health_check_enabled = True
+health_check_interval = 10
+health_check_max_retries = 3
+heartbeat_port = 5555
+heartbeat_key = changeme
+heartbeat_interval = 5
+heartbeat_timeout = 30
